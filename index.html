@@ -1,0 +1,1117 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>DOOM Clone — Raycaster educativo</title>
+<style>
+  /* Pantalla completa, fondo negro, canvas pixelado estilo retro */
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    height: 100%;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  #contenedor {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+  }
+  canvas {
+    /* El canvas interno es 640x400, lo escalamos manteniendo proporción.
+       image-rendering: pixelated evita el suavizado y conserva el look retro. */
+    width: min(100vw, 160vh);
+    height: auto;
+    image-rendering: pixelated;
+    cursor: crosshair;
+  }
+  /* Overlay para los mensajes de inicio / muerte / victoria */
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.75);
+    color: #ff4422;
+    text-align: center;
+    user-select: none;
+    cursor: pointer;
+  }
+  #overlay h1 { font-size: 48px; margin: 0 0 16px; text-shadow: 4px 4px 0 #550000; }
+  #overlay p  { color: #ccc; font-size: 16px; line-height: 1.8; margin: 4px; }
+  #overlay .tecla { color: #ffcc00; }
+  .oculto { display: none !important; }
+</style>
+</head>
+<body>
+<div id="contenedor">
+  <canvas id="pantalla" width="640" height="400"></canvas>
+</div>
+
+<div id="overlay">
+  <h1>FABLE-DOOM</h1>
+  <p>Un clon de DOOM con <b>ray casting</b> — mira el código fuente, está todo comentado.</p>
+  <p>
+    <span class="tecla">W A S D</span> moverse &nbsp;|&nbsp;
+    <span class="tecla">←  →</span> o <span class="tecla">ratón</span> girar &nbsp;|&nbsp;
+    <span class="tecla">clic / espacio</span> disparar
+  </p>
+  <p>Mata demonios y encuentra la salida (panel verde EXIT).</p>
+  <p style="margin-top:24px; color:#ffcc00">— HAZ CLIC PARA JUGAR —</p>
+</div>
+
+<script>
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ¿QUÉ ES EL RAY CASTING?
+   ═══════════════════════════════════════════════════════════════════════════
+
+   El truco que usaba Wolfenstein 3D / DOOM para parecer 3D sin serlo:
+
+   1. El mundo es solo un MAPA 2D, una cuadrícula donde cada celda es
+      pared (>0) o vacío (0). El jugador es un punto (x, y) con una
+      dirección de mirada.
+
+   2. Por CADA COLUMNA de píxeles de la pantalla lanzamos UN RAYO desde el
+      jugador hacia el mundo, y medimos a qué distancia choca con una pared.
+
+   3. Cuanto MÁS CERCA está la pared, MÁS ALTA dibujamos esa columna en
+      pantalla (perspectiva: las cosas cercanas se ven grandes).
+
+   Pantalla de 640 px de ancho = 640 rayos por fotograma. Cada rayo produce
+   una franja vertical de 1 px de ancho. Juntas forman la vista "3D".
+
+        MAPA (vista desde arriba)              PANTALLA (lo que se dibuja)
+        ┌───┬───┬───┬───┐                      │  ██     │
+        │ ▓ │ ▓ │ ▓ │ ▓ │                      │ ████  █ │ ← columnas más
+        ├───┼───┼───┼───┤                      │ ████ ██ │   altas = pared
+        │   │ P→··rayo··│──→ choca aquí        │ ████  █ │   más cercana
+        ├───┼───┼───┼───┤                      │  ██     │
+        │ ▓ │   │   │ ▓ │                      └─────────┘
+        └───┴───┴───┴───┘
+
+   El resto (enemigos, pistola, HUD) son sprites 2D dibujados encima.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   1. EL MAPA
+   ═══════════════════════════════════════════════════════════════════════════
+   Lo escribimos como texto para poder "verlo". Cada carácter es una celda:
+     .        suelo vacío (se puede caminar)
+     1 2 3 4  tipos de pared (cada número usa una textura distinta)
+     S        la salida (panel EXIT, tocarla = victoria)
+     P        posición inicial del jugador
+     E        enemigo    M  botiquín    A  munición
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const MAPA_TEXTO = [
+  "111111111111111111111111",
+  "1......1........2......1",
+  "1.P....1...E....2..A...1",
+  "1......1........2......1",
+  "1...1111.....2222......1",
+  "1......1........2...E..1",
+  "1..E...1...M...........1",
+  "11111.111111111122.22221",
+  "1......................1",
+  "1.333..3333......44.4441",
+  "1.3.......3..E...4....41",
+  "1.3..E....3......4.A..41",
+  "1.3.......3...1114....41",
+  "1.333.33333......4....41",
+  "1................44.4441",
+  "111.11111.11111........1",
+  "1......1...A...1..E....1",
+  "1..E...1.......1.......1",
+  "1......11.11111111.11111",
+  "1.M....1.......1.......1",
+  "1......1..E....1...E...1",
+  "1......1.......1...M...1",
+  "1...E..1.......1......S1",
+  "111111111111111111111111",
+];
+
+const MAPA_ALTO  = MAPA_TEXTO.length;        // filas (coordenada Y)
+const MAPA_ANCHO = MAPA_TEXTO[0].length;     // columnas (coordenada X)
+
+// MAPA[y][x] será un número: 0 = vacío, 1-4 = pared, 9 = salida.
+// Las entidades (P, E, M, A) se extraen del texto al cargar (ver reiniciar()).
+let MAPA = [];
+
+// Validación: si una fila no mide lo mismo, el raycaster fallaría de formas
+// raras, así que mejor avisar pronto y claro.
+for (const fila of MAPA_TEXTO) {
+  if (fila.length !== MAPA_ANCHO) {
+    throw new Error("Fila del mapa con longitud incorrecta: '" + fila + "'");
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   2. ESTADO DEL JUEGO: jugador, cámara, enemigos, objetos
+   ═══════════════════════════════════════════════════════════════════════════
+
+   LA CÁMARA — la parte más importante de entender:
+
+   El jugador tiene un vector DIRECCIÓN (dirX, dirY): hacia dónde mira.
+   Y un vector PLANO DE CÁMARA (planoX, planoY): perpendicular a la
+   dirección. El plano representa la "pantalla" dentro del mundo:
+
+                  plano
+              ────────────── ← la pantalla, vista desde arriba
+              ╲     ↑      ╱
+        rayo → ╲    │dir  ╱ ← rayo de la columna derecha
+                ╲   │    ╱
+                 ╲  │   ╱
+                  ╲ │  ╱
+                   ╲│ ╱
+                    P  ← jugador
+
+   El rayo de cada columna x de pantalla se calcula como:
+       rayo = dir + plano * camaraX
+   donde camaraX va de -1 (columna izquierda) a +1 (columna derecha).
+
+   El CAMPO DE VISIÓN (FOV) depende de la proporción |plano| / |dir|.
+   Con |dir| = 1 y |plano| = 0.66 obtenemos un FOV de ~66°, el clásico.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const jugador = {
+  x: 2.5, y: 2.5,          // posición en unidades del mapa (1 celda = 1.0)
+  dirX: 1, dirY: 0,        // dirección de mirada (vector unitario)
+  planoX: 0, planoY: 0.66, // plano de cámara (perpendicular a dir, FOV 66°)
+  vida: 100,
+  municion: 24,
+};
+
+const VELOCIDAD_MOVIMIENTO = 3.4;  // celdas por segundo
+const VELOCIDAD_GIRO       = 2.6;  // radianes por segundo (con flechas)
+const RADIO_JUGADOR        = 0.25; // para no pegarse a las paredes
+
+let enemigos = [];   // {x, y, vida, estado, timerAtaque, timerDolor}
+let objetos  = [];   // {x, y, tipo: 'medkit'|'ammo'}
+let estadoJuego = "titulo";        // 'titulo' | 'jugando' | 'muerto' | 'victoria'
+let bajasTotales = 0;
+let enemigosIniciales = 0;
+let flashDanio = 0;   // segundos restantes de pantallazo rojo al recibir daño
+let flashRecoger = 0; // pantallazo verde al recoger un objeto
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   3. TEXTURAS PROCEDURALES
+   ═══════════════════════════════════════════════════════════════════════════
+   Para no depender de archivos de imagen, dibujamos las texturas (64x64) en
+   canvas fuera de pantalla al arrancar. El raycaster luego copia columnas
+   verticales de 1 px de estas texturas a la pantalla.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const TEX = 64; // tamaño de cada textura (64x64 píxeles, como Wolfenstein)
+
+function crearTextura(dibujar) {
+  const c = document.createElement("canvas");
+  c.width = TEX; c.height = TEX;
+  const g = c.getContext("2d");
+  dibujar(g);
+  return c;
+}
+
+const texturas = {}; // texturas[numeroDePared] = canvas 64x64
+
+// Textura 1: ladrillo rojo (filas de ladrillos desplazadas, juntas oscuras)
+texturas[1] = crearTextura(g => {
+  g.fillStyle = "#5a1f17"; g.fillRect(0, 0, TEX, TEX);          // mortero
+  for (let fila = 0; fila < 8; fila++) {
+    const desfase = (fila % 2) * 8; // filas alternas desplazadas medio ladrillo
+    for (let col = -1; col < 4; col++) {
+      g.fillStyle = `rgb(${150 + (fila * 7 + col * 13) % 30}, 55, 40)`;
+      g.fillRect(col * 16 + desfase + 1, fila * 8 + 1, 14, 6);
+    }
+  }
+});
+
+// Textura 2: bloques de piedra gris
+texturas[2] = crearTextura(g => {
+  g.fillStyle = "#222"; g.fillRect(0, 0, TEX, TEX);
+  for (let fila = 0; fila < 4; fila++) {
+    const desfase = (fila % 2) * 16;
+    for (let col = -1; col < 3; col++) {
+      const tono = 95 + ((fila * 31 + col * 17) % 35);
+      g.fillStyle = `rgb(${tono},${tono},${tono + 8})`;
+      g.fillRect(col * 32 + desfase + 1, fila * 16 + 1, 30, 14);
+      // grietas sutiles
+      g.fillStyle = "rgba(0,0,0,0.25)";
+      g.fillRect(col * 32 + desfase + 8 + (fila * 5) % 12, fila * 16 + 4, 1, 8);
+    }
+  }
+});
+
+// Textura 3: panel tecnológico azul con remaches
+texturas[3] = crearTextura(g => {
+  g.fillStyle = "#1d2b40"; g.fillRect(0, 0, TEX, TEX);
+  g.fillStyle = "#2a3e5c"; g.fillRect(4, 4, 56, 56);
+  g.fillStyle = "#16202f"; g.fillRect(8, 30, 48, 4);   // ranura central
+  g.fillStyle = "#46d0ff";                              // luces
+  g.fillRect(12, 12, 8, 4); g.fillRect(44, 12, 8, 4);
+  g.fillStyle = "#0a141f";
+  for (const px of [6, 56]) for (const py of [6, 56]) g.fillRect(px, py, 3, 3);
+});
+
+// Textura 4: pared "infernal" — carne oscura con vetas
+texturas[4] = crearTextura(g => {
+  g.fillStyle = "#3a0d0d"; g.fillRect(0, 0, TEX, TEX);
+  for (let i = 0; i < 60; i++) { // manchas pseudoaleatorias pero deterministas
+    const x = (i * 37) % TEX, y = (i * 23 + 11) % TEX;
+    g.fillStyle = i % 3 ? "#561414" : "#771d11";
+    g.fillRect(x, y, 5 + i % 7, 3 + i % 5);
+  }
+  g.strokeStyle = "#8a2a14"; g.lineWidth = 2;           // vetas
+  g.beginPath(); g.moveTo(10, 0); g.bezierCurveTo(30, 20, 0, 44, 24, 64); g.stroke();
+  g.beginPath(); g.moveTo(48, 0); g.bezierCurveTo(38, 30, 60, 40, 50, 64); g.stroke();
+});
+
+// Textura 9: la SALIDA — panel verde con la palabra EXIT
+texturas[9] = crearTextura(g => {
+  g.fillStyle = "#0a2a0a"; g.fillRect(0, 0, TEX, TEX);
+  g.fillStyle = "#114411"; g.fillRect(3, 3, 58, 58);
+  g.fillStyle = "#22ff44";
+  g.font = "bold 20px monospace";
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText("EXIT", 32, 32);
+  g.strokeStyle = "#22ff44"; g.lineWidth = 2;
+  g.strokeRect(6, 6, 52, 52);
+});
+
+// Sprite del demonio (64x64 con fondo transparente)
+const texDemonio = crearTextura(g => {
+  g.fillStyle = "#7a2a1a";                               // cuerpo
+  g.beginPath(); g.ellipse(32, 38, 18, 24, 0, 0, Math.PI * 2); g.fill();
+  g.beginPath(); g.ellipse(32, 18, 13, 12, 0, 0, Math.PI * 2); g.fill(); // cabeza
+  g.fillStyle = "#5a1d10";                               // cuernos
+  g.beginPath(); g.moveTo(21, 14); g.lineTo(14, 2);  g.lineTo(25, 9);  g.fill();
+  g.beginPath(); g.moveTo(43, 14); g.lineTo(50, 2);  g.lineTo(39, 9);  g.fill();
+  g.fillStyle = "#ffee00";                               // ojos
+  g.fillRect(25, 15, 5, 4); g.fillRect(34, 15, 5, 4);
+  g.fillStyle = "#000";
+  g.fillRect(27, 16, 2, 2); g.fillRect(36, 16, 2, 2);
+  g.fillStyle = "#3a0d08"; g.fillRect(26, 24, 12, 3);    // boca
+  g.fillStyle = "#fff";                                  // dientes
+  for (let i = 0; i < 4; i++) g.fillRect(27 + i * 3, 24, 2, 2);
+  g.fillStyle = "#5a1d10";                               // brazos
+  g.fillRect(10, 32, 8, 18); g.fillRect(46, 32, 8, 18);
+  g.fillStyle = "#4a150c";                               // patas
+  g.fillRect(22, 56, 7, 8); g.fillRect(35, 56, 7, 8);
+});
+
+// Sprite del botiquín
+const texMedkit = crearTextura(g => {
+  g.fillStyle = "#ddd"; g.fillRect(10, 22, 44, 32);
+  g.fillStyle = "#999"; g.fillRect(10, 22, 44, 5);
+  g.fillStyle = "#cc1111";                               // cruz roja
+  g.fillRect(27, 28, 10, 22); g.fillRect(21, 34, 22, 10);
+});
+
+// Sprite de la caja de munición
+const texAmmo = crearTextura(g => {
+  g.fillStyle = "#5a4a1a"; g.fillRect(12, 28, 40, 26);
+  g.fillStyle = "#7a6526"; g.fillRect(12, 28, 40, 6);
+  g.fillStyle = "#d4af37";                               // balas asomando
+  for (let i = 0; i < 5; i++) g.fillRect(16 + i * 7, 20, 4, 10);
+});
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   4. EL CORAZÓN DEL JUEGO: EL RAYCASTER (algoritmo DDA)
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Para cada rayo necesitamos saber QUÉ celda del mapa golpea y A QUÉ
+   DISTANCIA. Podríamos avanzar el rayo en pasitos pequeños (0.01, 0.02...)
+   y comprobar el mapa en cada paso, pero sería lento e impreciso (podría
+   "saltarse" una esquina).
+
+   En su lugar usamos DDA (Digital Differential Analysis): saltar de
+   FRONTERA DE CELDA en frontera de celda. El rayo solo puede entrar en una
+   pared al cruzar una línea vertical (frontera X) u horizontal (frontera Y)
+   de la cuadrícula, así que solo comprobamos esos puntos. Exacto y rápido.
+
+   Idea clave: mantenemos dos "distancias candidatas" recorridas por el rayo:
+     ladoDistX = distancia hasta la PRÓXIMA frontera vertical
+     ladoDistY = distancia hasta la PRÓXIMA frontera horizontal
+   En cada paso avanzamos hacia la frontera MÁS CERCANA (la menor de las
+   dos), entramos en la celda vecina, y comprobamos si es pared.
+
+      │     │     │
+   ───┼─────┼─────┼───      P = jugador,  * = cruces que evalúa DDA
+      │   ▓▓▓▓▓   │         El rayo cruza primero una frontera vertical,
+   ───┼────*┼─────┼───      luego una horizontal, luego otra vertical...
+      │  *  │     │         y en cada cruce miramos: ¿la celda nueva
+   ───┼*────┼─────┼───      es pared? Si sí, paramos.
+      P     │     │
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function lanzarRayo(origenX, origenY, rayoDirX, rayoDirY) {
+  // Celda del mapa en la que estamos ahora mismo
+  let mapaX = Math.floor(origenX);
+  let mapaY = Math.floor(origenY);
+
+  // deltaDistX = cuánto AVANZA EL RAYO (en longitud sobre el propio rayo)
+  // por cada celda que cruzamos en X. Sale de semejanza de triángulos:
+  // si el rayo avanza 1 unidad en X, su longitud crece |1 / rayoDirX|.
+  // (Si rayoDirX es 0 el rayo es vertical y nunca cruza fronteras X → Infinity)
+  const deltaDistX = rayoDirX === 0 ? Infinity : Math.abs(1 / rayoDirX);
+  const deltaDistY = rayoDirY === 0 ? Infinity : Math.abs(1 / rayoDirY);
+
+  // pasoX/pasoY: hacia dónde saltamos de celda (+1 o -1) según el signo
+  // del rayo. ladoDistX/Y: distancia desde el origen hasta la PRIMERA
+  // frontera de celda (después ya será siempre saltar deltaDist completos).
+  let pasoX, pasoY, ladoDistX, ladoDistY;
+
+  if (rayoDirX < 0) {
+    pasoX = -1;
+    // Vamos hacia la izquierda: la primera frontera X está a
+    // (origenX - mapaX) celdas de distancia horizontal
+    ladoDistX = (origenX - mapaX) * deltaDistX;
+  } else {
+    pasoX = 1;
+    // Hacia la derecha: la frontera está en mapaX + 1
+    ladoDistX = (mapaX + 1 - origenX) * deltaDistX;
+  }
+  if (rayoDirY < 0) {
+    pasoY = -1;
+    ladoDistY = (origenY - mapaY) * deltaDistY;
+  } else {
+    pasoY = 1;
+    ladoDistY = (mapaY + 1 - origenY) * deltaDistY;
+  }
+
+  // ── El bucle DDA propiamente dicho ──
+  // lado: 0 = la pared se golpeó cruzando una frontera vertical (cara
+  // este/oeste), 1 = frontera horizontal (cara norte/sur). Lo usamos para
+  // sombrear y para calcular la coordenada de textura.
+  let lado = 0;
+  let tipoPared = 0;
+
+  while (tipoPared === 0) {
+    // ¿Qué frontera está más cerca? Saltamos a esa.
+    if (ladoDistX < ladoDistY) {
+      ladoDistX += deltaDistX;  // reservamos ya la SIGUIENTE frontera X
+      mapaX += pasoX;           // entramos en la celda vecina en X
+      lado = 0;
+    } else {
+      ladoDistY += deltaDistY;
+      mapaY += pasoY;
+      lado = 1;
+    }
+    tipoPared = MAPA[mapaY][mapaX]; // ¿la celda nueva es pared? (>0 = sí)
+  }
+
+  /* DISTANCIA PERPENDICULAR — la corrección del "ojo de pez":
+
+     Si usáramos la distancia euclídea real del rayo, las paredes se verían
+     curvadas: los rayos de los bordes de la pantalla recorren más camino
+     que el central aunque la pared esté "igual de lejos" de la cámara.
+
+     La solución es medir la distancia PERPENDICULAR al plano de cámara
+     (es decir, proyectada sobre la dirección de mirada), no a lo largo
+     del rayo:
+                    pared
+              ──────┬──────
+                 ╲  │ d (perpendicular: la que usamos)
+            rayo  ╲ │
+            largo  ╲│
+                    P ── plano de cámara
+
+     Truco elegante del DDA: al golpear la pared, ladoDist ya se había
+     incrementado UNA VEZ DE MÁS (lo hacemos antes de comprobar la celda),
+     así que (ladoDist - deltaDist) es exactamente la distancia recorrida
+     hasta la frontera donde golpeamos... ¡y resulta que esa cantidad,
+     por cómo se construyó con deltaDist = 1/|rayoDir| y el rayo
+     rayo = dir + plano·camaraX, ya ES la distancia perpendicular! */
+  const distPerp = lado === 0
+    ? ladoDistX - deltaDistX
+    : ladoDistY - deltaDistY;
+
+  /* COORDENADA DE TEXTURA: ¿en qué punto exacto (0..1) de la cara de la
+     pared golpeó el rayo? Si golpeamos una cara vertical (lado 0), lo que
+     varía a lo largo de la cara es Y; calculamos la Y exacta del impacto
+     y nos quedamos con la parte fraccionaria. */
+  let paredX; // 0.0 = borde izquierdo de la cara, 0.999 = borde derecho
+  if (lado === 0) paredX = origenY + distPerp * rayoDirY;
+  else            paredX = origenX + distPerp * rayoDirX;
+  paredX -= Math.floor(paredX); // parte fraccionaria
+
+  return { distPerp, tipoPared, lado, paredX, rayoDirX, rayoDirY };
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   5. RENDERIZADO DE LA ESCENA
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const canvas = document.getElementById("pantalla");
+const ctx = canvas.getContext("2d");
+const ANCHO = canvas.width;   // 640: también es el número de rayos
+const ALTO  = canvas.height;  // 400
+
+// El Z-BUFFER: para cada columna de pantalla guardamos la distancia de la
+// pared dibujada ahí. Al dibujar sprites lo consultamos: si el sprite está
+// MÁS LEJOS que la pared de esa columna, esa franja del sprite no se dibuja
+// (está oculto detrás de la pared).
+const zBuffer = new Float32Array(ANCHO);
+
+// Degradados de cielo y suelo (precalculados, no cambian)
+const gradCielo = ctx.createLinearGradient(0, 0, 0, ALTO / 2);
+gradCielo.addColorStop(0, "#1a1a22");
+gradCielo.addColorStop(1, "#3a3a45");
+const gradSuelo = ctx.createLinearGradient(0, ALTO / 2, 0, ALTO);
+gradSuelo.addColorStop(0, "#3d2e22");
+gradSuelo.addColorStop(1, "#1c140e");
+
+function dibujarMundo() {
+  // ── Cielo y suelo: dos rectángulos con degradado ──
+  // (los degradados imitan que lo lejano —cerca del horizonte— está más
+  // oscuro, sin el coste de un "floor casting" real por píxel)
+  ctx.fillStyle = gradCielo; ctx.fillRect(0, 0, ANCHO, ALTO / 2);
+  ctx.fillStyle = gradSuelo; ctx.fillRect(0, ALTO / 2, ANCHO, ALTO / 2);
+
+  // ── Paredes: un rayo por columna de pantalla ──
+  for (let x = 0; x < ANCHO; x++) {
+    // camaraX: posición de esta columna en el plano de cámara, de -1
+    // (izquierda) a +1 (derecha). Es el factor que mezcla dir y plano.
+    const camaraX = 2 * x / ANCHO - 1;
+    const rayoDirX = jugador.dirX + jugador.planoX * camaraX;
+    const rayoDirY = jugador.dirY + jugador.planoY * camaraX;
+
+    const r = lanzarRayo(jugador.x, jugador.y, rayoDirX, rayoDirY);
+    zBuffer[x] = r.distPerp; // guardar para la oclusión de sprites
+
+    // PERSPECTIVA: la altura en pantalla es inversamente proporcional a
+    // la distancia. Una pared a distancia 1 ocupa toda la pantalla;
+    // a distancia 2, la mitad; etc. Esta única división es toda la
+    // "proyección 3D" del motor.
+    const alturaLinea = Math.floor(ALTO / r.distPerp);
+
+    // Centramos la franja verticalmente (el horizonte está en ALTO/2)
+    let inicioY = Math.floor(-alturaLinea / 2 + ALTO / 2);
+    let finY    = Math.floor( alturaLinea / 2 + ALTO / 2);
+
+    // Columna de textura: paredX (0..1) → píxel (0..63) de la textura
+    let texX = Math.floor(r.paredX * TEX);
+    // Espejamos la textura en dos caras para que no se vea "al revés"
+    // según desde qué lado miremos la pared
+    if (r.lado === 0 && rayoDirX > 0) texX = TEX - 1 - texX;
+    if (r.lado === 1 && rayoDirY < 0) texX = TEX - 1 - texX;
+
+    // Copiamos UNA columna de 1px de la textura, estirada a alturaLinea.
+    // drawImage hace el escalado por nosotros (y recorta lo que se sale
+    // de pantalla automáticamente).
+    const tex = texturas[r.tipoPared] || texturas[1];
+    ctx.drawImage(tex, texX, 0, 1, TEX, x, inicioY, 1, finY - inicioY);
+
+    // ── Sombreado ──
+    // 1) Las caras norte/sur (lado 1) se oscurecen un poco: es la forma
+    //    barata de "iluminación" que da volumen a las esquinas.
+    // 2) La distancia oscurece (niebla): vendemos profundidad.
+    const oscuridad = Math.min(0.82, r.distPerp / 13 + (r.lado === 1 ? 0.22 : 0));
+    if (oscuridad > 0.02) {
+      ctx.fillStyle = `rgba(0,0,0,${oscuridad})`;
+      ctx.fillRect(x, inicioY, 1, finY - inicioY);
+    }
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   6. SPRITES (enemigos y objetos): proyectarlos sobre la pantalla
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Un sprite es un punto (x, y) en el mapa con una imagen 2D. Para dibujarlo:
+
+   1. Pasamos su posición a COORDENADAS DE CÁMARA: un sistema donde el
+      jugador es el origen, "Y" apunta hacia donde mira (profundidad) y
+      "X" es lateral. Eso se hace multiplicando por la INVERSA de la
+      matriz de cámara [plano | dir]:
+
+         | transX |        1        |  dirY   -dirX |   | spriteX |
+         |        | = ─────────────·|               | · |         |
+         | transY |   (planoX·dirY  | -planoY planoX|   | spriteY |
+                       -dirX·planoY)
+
+      transY = profundidad (qué tan "delante" está; si es <= 0 está
+      detrás de nosotros y no se dibuja). transX = desplazamiento lateral.
+
+   2. La columna de pantalla donde cae su centro:
+         pantallaX = (ANCHO/2) · (1 + transX / transY)
+      (la misma división por la profundidad que usamos con las paredes)
+
+   3. Su tamaño en pantalla también es ALTO / transY (más lejos = más
+      pequeño), igual que las paredes. Así los sprites y las paredes
+      "encajan" en escala perfectamente.
+
+   4. Se dibuja columna a columna comparando con el Z-BUFFER, para que
+      las paredes lo tapen correctamente.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function dibujarSprites() {
+  // Lista unificada: enemigos + objetos, cada uno con su imagen y escala
+  const sprites = [];
+  for (const e of enemigos) {
+    sprites.push({ x: e.x, y: e.y, tex: texDemonio, escala: 0.85, ent: e });
+  }
+  for (const o of objetos) {
+    sprites.push({ x: o.x, y: o.y, tex: o.tipo === "medkit" ? texMedkit : texAmmo, escala: 0.5, ent: null });
+  }
+
+  // Distancia al jugador (al cuadrado basta para ordenar: nos ahorramos
+  // la raíz cuadrada)
+  for (const s of sprites) {
+    s.dist2 = (s.x - jugador.x) ** 2 + (s.y - jugador.y) ** 2;
+  }
+  // Pintamos de LEJOS a CERCA ("algoritmo del pintor"): los cercanos se
+  // dibujan después y tapan a los lejanos.
+  sprites.sort((a, b) => b.dist2 - a.dist2);
+
+  for (const s of sprites) {
+    // Posición del sprite RELATIVA al jugador
+    const relX = s.x - jugador.x;
+    const relY = s.y - jugador.y;
+
+    // Transformación a coordenadas de cámara (inversa de la matriz 2x2)
+    const invDet = 1 / (jugador.planoX * jugador.dirY - jugador.dirX * jugador.planoY);
+    const transX = invDet * (jugador.dirY * relX - jugador.dirX * relY);   // lateral
+    const transY = invDet * (-jugador.planoY * relX + jugador.planoX * relY); // profundidad
+
+    if (transY <= 0.1) continue; // detrás del jugador (o demasiado encima)
+
+    // Columna central del sprite en pantalla
+    const pantallaX = Math.floor((ANCHO / 2) * (1 + transX / transY));
+
+    // Tamaño en pantalla: la misma fórmula de perspectiva de las paredes
+    const altoSprite  = Math.floor((ALTO / transY) * s.escala);
+    const anchoSprite = altoSprite; // sprites cuadrados
+
+    // ANCLADO AL SUELO: el borde inferior del sprite debe coincidir con
+    // donde la pared toca el suelo a esa misma profundidad, es decir
+    // ALTO/2 + (ALTO/transY)/2. Así los objetos "apoyan" en el suelo.
+    const baseY   = Math.floor(ALTO / 2 + (ALTO / transY) / 2);
+    const inicioY = baseY - altoSprite;
+
+    const inicioX = pantallaX - Math.floor(anchoSprite / 2);
+
+    // Si el enemigo acaba de recibir un disparo, lo dibujamos "quemado"
+    // en blanco un instante (feedback visual del impacto)
+    if (s.ent && s.ent.timerDolor > 0) ctx.filter = "brightness(3)";
+
+    // Dibujado columna a columna, consultando el z-buffer
+    for (let col = 0; col < anchoSprite; col++) {
+      const x = inicioX + col;
+      if (x < 0 || x >= ANCHO) continue;       // fuera de pantalla
+      if (transY >= zBuffer[x]) continue;      // tapado por una pared
+
+      // Columna de la textura correspondiente a esta columna de pantalla
+      const texX = Math.floor(col * TEX / anchoSprite);
+      ctx.drawImage(s.tex, texX, 0, 1, TEX, x, inicioY, 1, altoSprite);
+    }
+    ctx.filter = "none";
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   7. ARMA, HUD Y MINIMAPA (capa 2D encima de la vista 3D)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+let armaTimer = 0;     // tiempo desde el último disparo (anima el retroceso)
+let balanceo = 0;      // fase del balanceo al caminar (head bob del arma)
+
+function dibujarArma() {
+  // El arma "bota" al caminar usando un seno, y "retrocede" al disparar
+  const bobX = Math.sin(balanceo) * 9;
+  const bobY = Math.abs(Math.cos(balanceo)) * 7;
+  const retroceso = armaTimer < 0.12 ? (0.12 - armaTimer) * 90 : 0;
+
+  const cx = ANCHO / 2 + bobX;
+  const cy = ALTO - 60 + bobY + retroceso;
+
+  // Fogonazo del cañón (solo unos milisegundos tras disparar)
+  if (armaTimer < 0.07) {
+    ctx.fillStyle = "#ffe066";
+    ctx.beginPath();
+    ctx.arc(cx, cy - 38, 16 + Math.random() * 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#fff8d0";
+    ctx.beginPath();
+    ctx.arc(cx, cy - 38, 7, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Pistola dibujada con rectángulos (vista desde detrás, estilo retro)
+  ctx.fillStyle = "#2b2b30"; ctx.fillRect(cx - 11, cy - 38, 22, 46); // cañón/corredera
+  ctx.fillStyle = "#3c3c44"; ctx.fillRect(cx - 8,  cy - 34, 16, 38);
+  ctx.fillStyle = "#17171b"; ctx.fillRect(cx - 4,  cy - 38, 8, 6);   // boca del cañón
+  ctx.fillStyle = "#6b4a2f"; ctx.fillRect(cx - 14, cy + 4, 28, 60);  // empuñadura/manos
+  ctx.fillStyle = "#8a6240"; ctx.fillRect(cx - 22, cy + 14, 10, 40);
+  ctx.fillStyle = "#8a6240"; ctx.fillRect(cx + 12, cy + 14, 10, 40);
+}
+
+function dibujarHUD() {
+  // Mira (crosshair) en el centro exacto: el disparo va hacia aquí
+  ctx.strokeStyle = "rgba(255,255,255,0.8)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(ANCHO / 2 - 6, ALTO / 2); ctx.lineTo(ANCHO / 2 + 6, ALTO / 2);
+  ctx.moveTo(ANCHO / 2, ALTO / 2 - 6); ctx.lineTo(ANCHO / 2, ALTO / 2 + 6);
+  ctx.stroke();
+
+  // Barra inferior estilo DOOM
+  ctx.fillStyle = "rgba(20,20,20,0.85)";
+  ctx.fillRect(0, ALTO - 26, ANCHO, 26);
+  ctx.font = "bold 15px monospace";
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.fillStyle = jugador.vida > 30 ? "#44dd44" : "#ff3333";
+  ctx.fillText("VIDA " + Math.max(0, Math.ceil(jugador.vida)) + "%", 14, ALTO - 13);
+  ctx.fillStyle = "#ffcc00";
+  ctx.fillText("BALAS " + jugador.municion, 160, ALTO - 13);
+  ctx.fillStyle = "#ff6644";
+  ctx.fillText("DEMONIOS " + bajasTotales + "/" + enemigosIniciales, 300, ALTO - 13);
+  ctx.fillStyle = "#888";
+  ctx.textAlign = "right";
+  ctx.fillText("ENCUENTRA LA SALIDA", ANCHO - 14, ALTO - 13);
+  ctx.textAlign = "left";
+
+  // Pantallazos: rojo al recibir daño, verde al recoger objetos
+  if (flashDanio > 0) {
+    ctx.fillStyle = `rgba(255,0,0,${Math.min(0.45, flashDanio * 1.5)})`;
+    ctx.fillRect(0, 0, ANCHO, ALTO);
+  }
+  if (flashRecoger > 0) {
+    ctx.fillStyle = `rgba(120,255,120,${Math.min(0.25, flashRecoger)})`;
+    ctx.fillRect(0, 0, ANCHO, ALTO);
+  }
+}
+
+function dibujarMinimapa() {
+  const ESCALA = 4; // píxeles por celda
+  const mx = 8, my = 8; // esquina del minimapa
+
+  ctx.globalAlpha = 0.75;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(mx - 2, my - 2, MAPA_ANCHO * ESCALA + 4, MAPA_ALTO * ESCALA + 4);
+
+  // Celdas: las paredes en gris, la salida en verde
+  for (let y = 0; y < MAPA_ALTO; y++) {
+    for (let x = 0; x < MAPA_ANCHO; x++) {
+      if (MAPA[y][x] === 0) continue;
+      ctx.fillStyle = MAPA[y][x] === 9 ? "#22cc44" : "#777";
+      ctx.fillRect(mx + x * ESCALA, my + y * ESCALA, ESCALA, ESCALA);
+    }
+  }
+  // Enemigos: puntos rojos
+  ctx.fillStyle = "#ff3322";
+  for (const e of enemigos) {
+    ctx.fillRect(mx + e.x * ESCALA - 1, my + e.y * ESCALA - 1, 3, 3);
+  }
+  // Jugador: punto amarillo + rayita de dirección
+  ctx.fillStyle = "#ffee22";
+  ctx.fillRect(mx + jugador.x * ESCALA - 2, my + jugador.y * ESCALA - 2, 4, 4);
+  ctx.strokeStyle = "#ffee22";
+  ctx.beginPath();
+  ctx.moveTo(mx + jugador.x * ESCALA, my + jugador.y * ESCALA);
+  ctx.lineTo(mx + (jugador.x + jugador.dirX * 2) * ESCALA,
+             my + (jugador.y + jugador.dirY * 2) * ESCALA);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   8. MOVIMIENTO Y COLISIONES
+   ═══════════════════════════════════════════════════════════════════════ */
+
+// ¿Se puede estar en (x, y)? Comprobamos las 4 esquinas de un cuadrado de
+// radio RADIO alrededor del punto, para no atravesar paredes por la esquina.
+function esTransitable(x, y, radio) {
+  for (const dx of [-radio, radio]) {
+    for (const dy of [-radio, radio]) {
+      const celda = MAPA[Math.floor(y + dy)][Math.floor(x + dx)];
+      if (celda === 9) return "salida"; // ¡tocamos el panel EXIT!
+      if (celda !== 0) return false;
+    }
+  }
+  return true;
+}
+
+// Mover con "deslizamiento": probamos X e Y POR SEPARADO. Si chocas de
+// frente contra una pared en diagonal, al menos te deslizas a lo largo de
+// ella en vez de quedarte clavado (como en cualquier FPS).
+function moverConColision(ent, dx, dy, radio) {
+  const rx = esTransitable(ent.x + dx, ent.y, radio);
+  if (rx === "salida") return "salida";
+  if (rx === true) ent.x += dx;
+
+  const ry = esTransitable(ent.x, ent.y + dy, radio);
+  if (ry === "salida") return "salida";
+  if (ry === true) ent.y += dy;
+  return true;
+}
+
+// Girar al jugador: rotamos AMBOS vectores (dirección y plano de cámara)
+// con la matriz de rotación 2D estándar:
+//   x' = x·cos(a) - y·sin(a)
+//   y' = x·sin(a) + y·cos(a)
+// Es vital rotar también el plano: si no, el FOV se deformaría al girar.
+function girarJugador(angulo) {
+  const cosA = Math.cos(angulo), sinA = Math.sin(angulo);
+  const dx = jugador.dirX;
+  jugador.dirX = dx * cosA - jugador.dirY * sinA;
+  jugador.dirY = dx * sinA + jugador.dirY * cosA;
+  const px = jugador.planoX;
+  jugador.planoX = px * cosA - jugador.planoY * sinA;
+  jugador.planoY = px * sinA + jugador.planoY * cosA;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   9. ENEMIGOS: IA sencilla (ver → perseguir → morder)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+// Línea de visión: marchamos del enemigo al jugador en pasitos cortos
+// comprobando el mapa. (Menos preciso que el DDA pero más fácil de leer;
+// para la IA es suficiente.)
+function hayLineaDeVision(x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const dist = Math.hypot(dx, dy);
+  const pasos = Math.ceil(dist / 0.1);
+  for (let i = 1; i < pasos; i++) {
+    const t = i / pasos;
+    if (MAPA[Math.floor(y0 + dy * t)][Math.floor(x0 + dx * t)] !== 0) {
+      return false; // hay una pared en medio
+    }
+  }
+  return true;
+}
+
+function actualizarEnemigos(dt) {
+  for (const e of enemigos) {
+    e.timerDolor  = Math.max(0, e.timerDolor - dt);
+    e.timerAtaque = Math.max(0, e.timerAtaque - dt);
+
+    const dx = jugador.x - e.x;
+    const dy = jugador.y - e.y;
+    const dist = Math.hypot(dx, dy);
+
+    // Estado "dormido": despierta si ve al jugador a menos de 9 celdas
+    if (e.estado === "dormido") {
+      if (dist < 9 && hayLineaDeVision(e.x, e.y, jugador.x, jugador.y)) {
+        e.estado = "persiguiendo";
+      }
+      continue;
+    }
+
+    // Persiguiendo: avanza en línea recta hacia el jugador. La colisión
+    // con deslizamiento hace que "bordee" las paredes de forma tosca pero
+    // creíble (sin necesidad de pathfinding).
+    if (dist > 1.0) {
+      const vel = 1.6 * dt;
+      moverConColision(e, (dx / dist) * vel, (dy / dist) * vel, 0.3);
+    }
+
+    // Al alcance: mordisco cada segundo
+    if (dist < 1.25 && e.timerAtaque <= 0) {
+      e.timerAtaque = 1.0;
+      jugador.vida -= 6 + Math.random() * 8;
+      flashDanio = 0.35;
+      sonido("dolor");
+      if (jugador.vida <= 0) morir();
+    }
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   10. DISPARAR
+   ═══════════════════════════════════════════════════════════════════════════
+   El disparo es "hitscan" (instantáneo, como la pistola de DOOM):
+   1. Lanzamos un rayo por el CENTRO de la pantalla para saber a qué
+      distancia está la pared de enfrente.
+   2. Para cada enemigo, usamos la MISMA transformación de cámara de los
+      sprites: si su centro cae cerca de la columna central de pantalla,
+      está delante (transY > 0) y está MÁS CERCA que la pared → impacto.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function disparar() {
+  if (jugador.municion <= 0) { sonido("vacio"); return; }
+  jugador.municion--;
+  armaTimer = 0;
+  sonido("disparo");
+
+  // Distancia a la pared justo enfrente (rayo central: camaraX = 0)
+  const pared = lanzarRayo(jugador.x, jugador.y, jugador.dirX, jugador.dirY);
+
+  // Los disparos hacen ruido: despiertan a los demonios cercanos
+  for (const e of enemigos) {
+    if (Math.hypot(e.x - jugador.x, e.y - jugador.y) < 11) e.estado = "persiguiendo";
+  }
+
+  // Buscar el enemigo válido MÁS CERCANO en la línea de tiro
+  let objetivo = null;
+  let mejorDist = Infinity;
+  const invDet = 1 / (jugador.planoX * jugador.dirY - jugador.dirX * jugador.planoY);
+
+  for (const e of enemigos) {
+    const relX = e.x - jugador.x, relY = e.y - jugador.y;
+    const transX = invDet * (jugador.dirY * relX - jugador.dirX * relY);
+    const transY = invDet * (-jugador.planoY * relX + jugador.planoX * relY);
+
+    if (transY <= 0) continue;            // detrás de nosotros
+    if (transY > pared.distPerp) continue; // hay una pared en medio
+
+    // ¿Cae el centro del sprite lo bastante cerca del centro de pantalla?
+    // El medio-ancho del sprite en pantalla es (ALTO/transY)·escala/2;
+    // damos por buena la mitad de eso (hay que apuntar de verdad).
+    const pantallaX = (ANCHO / 2) * (1 + transX / transY);
+    const medioAncho = (ALTO / transY) * 0.85 * 0.5;
+    if (Math.abs(pantallaX - ANCHO / 2) > medioAncho * 0.7) continue;
+
+    if (transY < mejorDist) { mejorDist = transY; objetivo = e; }
+  }
+
+  if (objetivo) {
+    objetivo.vida -= 12 + Math.random() * 6; // 2-3 disparos por demonio
+    objetivo.timerDolor = 0.15;
+    objetivo.estado = "persiguiendo";
+    if (objetivo.vida <= 0) {
+      enemigos = enemigos.filter(e => e !== objetivo);
+      bajasTotales++;
+      sonido("muerteDemonio");
+    } else {
+      sonido("impacto");
+    }
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   11. SONIDO: efectos sintetizados con WebAudio (sin archivos)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+let audioCtx = null; // se crea en el primer clic (los navegadores lo exigen)
+
+// Un "beep" con barrido de frecuencia y envolvente de volumen decreciente
+function tono(tipo, f0, f1, duracion, volumen) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gan = audioCtx.createGain();
+  osc.type = tipo;
+  osc.frequency.setValueAtTime(f0, t);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + duracion);
+  gan.gain.setValueAtTime(volumen, t);
+  gan.gain.exponentialRampToValueAtTime(0.001, t + duracion);
+  osc.connect(gan).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + duracion);
+}
+
+function sonido(nombre) {
+  switch (nombre) {
+    case "disparo":       tono("square",   400,  60, 0.13, 0.25); break;
+    case "impacto":       tono("sawtooth", 200,  70, 0.12, 0.20); break;
+    case "muerteDemonio": tono("sawtooth", 320,  30, 0.45, 0.30); break;
+    case "dolor":         tono("square",    90,  50, 0.25, 0.30); break;
+    case "recoger":       tono("sine",     440, 880, 0.15, 0.25); break;
+    case "vacio":         tono("square",   120, 100, 0.05, 0.15); break;
+    case "victoria":
+      tono("sine", 440, 440, 0.15, 0.3);
+      setTimeout(() => tono("sine", 554, 554, 0.15, 0.3), 150);
+      setTimeout(() => tono("sine", 659, 659, 0.4, 0.3), 300);
+      break;
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   12. ENTRADA: teclado y ratón (con pointer lock para girar como en un FPS)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const teclas = {}; // teclas pulsadas ahora mismo: teclas['KeyW'] === true
+
+addEventListener("keydown", ev => {
+  teclas[ev.code] = true;
+  if (ev.code === "Space") { // espacio dispara (y evitamos que haga scroll)
+    ev.preventDefault();
+    if (estadoJuego === "jugando") disparar();
+  }
+});
+addEventListener("keyup", ev => { teclas[ev.code] = false; });
+
+const overlay = document.getElementById("overlay");
+
+overlay.addEventListener("click", () => {
+  // El primer clic crea el contexto de audio (requisito de los navegadores)
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (estadoJuego !== "jugando") reiniciar();
+  overlay.classList.add("oculto");
+  canvas.requestPointerLock(); // capturar el ratón para girar la vista
+});
+
+canvas.addEventListener("click", () => {
+  if (estadoJuego !== "jugando") return;
+  // Si el ratón no está capturado, primero lo capturamos; si ya lo está,
+  // el clic dispara.
+  if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+  else disparar();
+});
+
+addEventListener("mousemove", ev => {
+  if (document.pointerLockElement === canvas && estadoJuego === "jugando") {
+    girarJugador(ev.movementX * 0.0022); // sensibilidad del ratón
+  }
+});
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   13. ACTUALIZACIÓN POR FOTOGRAMA Y BUCLE PRINCIPAL
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function actualizar(dt) {
+  // ── Giro con flechas (alternativa al ratón) ──
+  if (teclas["ArrowLeft"])  girarJugador(-VELOCIDAD_GIRO * dt);
+  if (teclas["ArrowRight"]) girarJugador( VELOCIDAD_GIRO * dt);
+
+  // ── Movimiento WASD ──
+  // Adelante/atrás: a lo largo del vector dirección.
+  // Izquierda/derecha (strafe): a lo largo del vector PERPENDICULAR a la
+  // dirección, que es simplemente (-dirY, dirX).
+  let mx = 0, my = 0;
+  const v = VELOCIDAD_MOVIMIENTO * dt;
+  if (teclas["KeyW"] || teclas["ArrowUp"])   { mx += jugador.dirX * v; my += jugador.dirY * v; }
+  if (teclas["KeyS"] || teclas["ArrowDown"]) { mx -= jugador.dirX * v; my -= jugador.dirY * v; }
+  if (teclas["KeyA"]) { mx += jugador.dirY * v; my -= jugador.dirX * v; }
+  if (teclas["KeyD"]) { mx -= jugador.dirY * v; my += jugador.dirX * v; }
+
+  if (mx !== 0 || my !== 0) {
+    balanceo += dt * 9; // anima el bamboleo del arma
+    if (moverConColision(jugador, mx, my, RADIO_JUGADOR) === "salida") {
+      ganar();
+      return;
+    }
+  }
+
+  // ── Recoger objetos cercanos ──
+  objetos = objetos.filter(o => {
+    if (Math.hypot(o.x - jugador.x, o.y - jugador.y) > 0.6) return true; // lejos: se queda
+    if (o.tipo === "medkit") jugador.vida = Math.min(100, jugador.vida + 25);
+    else                     jugador.municion = Math.min(99, jugador.municion + 8);
+    flashRecoger = 0.3;
+    sonido("recoger");
+    return false; // recogido: se elimina de la lista
+  });
+
+  actualizarEnemigos(dt);
+
+  armaTimer    += dt;
+  flashDanio    = Math.max(0, flashDanio - dt);
+  flashRecoger  = Math.max(0, flashRecoger - dt);
+}
+
+let tiempoAnterior = performance.now();
+
+function buclePrincipal(ahora) {
+  // dt = segundos desde el fotograma anterior. Multiplicar TODO movimiento
+  // por dt hace que el juego vaya igual de rápido a 30 que a 144 FPS.
+  // Lo limitamos a 50 ms por si la pestaña estuvo en segundo plano.
+  const dt = Math.min(0.05, (ahora - tiempoAnterior) / 1000);
+  tiempoAnterior = ahora;
+
+  if (estadoJuego === "jugando") actualizar(dt);
+
+  // Renderizado: primero el mundo 3D, luego las capas 2D encima
+  dibujarMundo();
+  dibujarSprites();
+  dibujarArma();
+  dibujarHUD();
+  dibujarMinimapa();
+
+  requestAnimationFrame(buclePrincipal);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   14. INICIO, MUERTE Y VICTORIA
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function reiniciar() {
+  // Reconstruir el MAPA numérico desde el texto, extrayendo las entidades
+  MAPA = [];
+  enemigos = [];
+  objetos = [];
+  for (let y = 0; y < MAPA_ALTO; y++) {
+    const fila = [];
+    for (let x = 0; x < MAPA_ANCHO; x++) {
+      const c = MAPA_TEXTO[y][x];
+      let celda = 0;
+      if (c >= "1" && c <= "4") celda = Number(c);
+      else if (c === "S") celda = 9;
+      else if (c === "P") { jugador.x = x + 0.5; jugador.y = y + 0.5; }
+      else if (c === "E") enemigos.push({ x: x + 0.5, y: y + 0.5, vida: 30, estado: "dormido", timerAtaque: 0, timerDolor: 0 });
+      else if (c === "M") objetos.push({ x: x + 0.5, y: y + 0.5, tipo: "medkit" });
+      else if (c === "A") objetos.push({ x: x + 0.5, y: y + 0.5, tipo: "ammo" });
+      fila.push(celda);
+    }
+    MAPA.push(fila);
+  }
+
+  jugador.dirX = 1;  jugador.dirY = 0;
+  jugador.planoX = 0; jugador.planoY = 0.66;
+  jugador.vida = 100;
+  jugador.municion = 24;
+  bajasTotales = 0;
+  enemigosIniciales = enemigos.length;
+  flashDanio = flashRecoger = 0;
+  armaTimer = 1;
+  estadoJuego = "jugando";
+}
+
+function mostrarOverlay(titulo, color, lineas) {
+  overlay.querySelector("h1").textContent = titulo;
+  overlay.querySelector("h1").style.color = color;
+  const ps = overlay.querySelectorAll("p");
+  ps.forEach((p, i) => { p.innerHTML = lineas[i] || ""; });
+  overlay.classList.remove("oculto");
+  document.exitPointerLock();
+}
+
+function morir() {
+  estadoJuego = "muerto";
+  mostrarOverlay("HAS MUERTO", "#ff2222", [
+    "Los demonios te han devorado.",
+    "Bajas: " + bajasTotales + " de " + enemigosIniciales,
+    "",
+    "<span style='color:#ffcc00'>— HAZ CLIC PARA REINTENTAR —</span>",
+  ]);
+}
+
+function ganar() {
+  estadoJuego = "victoria";
+  sonido("victoria");
+  mostrarOverlay("¡VICTORIA!", "#22ff44", [
+    "Has encontrado la salida.",
+    "Demonios eliminados: " + bajasTotales + " de " + enemigosIniciales,
+    "",
+    "<span style='color:#ffcc00'>— HAZ CLIC PARA JUGAR OTRA VEZ —</span>",
+  ]);
+}
+
+// ¡Arrancamos! El bucle corre siempre (también dibuja detrás del overlay
+// de título); el estado del juego decide si se actualiza la lógica.
+reiniciar();
+estadoJuego = "titulo";
+requestAnimationFrame(buclePrincipal);
+</script>
+</body>
+</html>
