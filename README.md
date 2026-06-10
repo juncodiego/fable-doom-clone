@@ -1,5 +1,8 @@
 # Fable-DOOM — A Raycaster DOOM Clone
 
+🎮 **Play it now:** https://fable-doom-clone.vercel.app/
+📦 **Source code:** https://github.com/juncodiego/fable-doom-clone
+
 A DOOM-style shooter built as a **single HTML file** with no dependencies, no assets, and no build step. Every texture, sprite, and sound effect is generated procedurally in code. Open `index.html` in a browser and play.
 
 The real purpose of this project is **educational**: the raycasting engine is heavily commented (in Spanish) and structured as a guided reading, so you can learn how Wolfenstein 3D / DOOM-era pseudo-3D rendering actually works.
